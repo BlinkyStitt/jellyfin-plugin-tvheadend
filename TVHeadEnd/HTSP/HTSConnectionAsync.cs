@@ -22,6 +22,7 @@ namespace TVHeadEnd.HTSP
         private readonly ByteList _buffer;
         private readonly BlockingBuffer<HTSMessage> _receivedMessagesQueue;
         private readonly BlockingBuffer<HTSMessage> _messagesForSendQueue;
+        private readonly object _responseLock = new object();
         private readonly Dictionary<int, IHTSResponseHandler?> _responseHandlers;
 
         private readonly CancellationTokenSource _receiveHandlerThreadTokenSource;
@@ -31,7 +32,7 @@ namespace TVHeadEnd.HTSP
 
         private volatile bool _needsRestart;
         private volatile bool _connected;
-        private volatile int _seq;
+        private int _seq;
 
         private int _serverProtocolVersion;
         private string? _servername;
@@ -313,22 +314,15 @@ namespace TVHeadEnd.HTSP
 
         public void SendMessage(HTSMessage message, IHTSResponseHandler? responseHandler)
         {
-            // loop the sequence number
-            if (_seq == int.MaxValue)
+            lock (_responseLock)
             {
-                _seq = int.MinValue;
-            }
-            else
-            {
-                _seq++;
-            }
+                _seq = unchecked(_seq + 1);
+                message.PutField("seq", _seq);
 
-            // housekeeping very old response handlers
-            _responseHandlers.Remove(_seq);
-
-            message.PutField("seq", _seq);
-            _messagesForSendQueue.Enqueue(message);
-            _responseHandlers.Add(_seq, responseHandler);
+                // A reply can arrive as soon as the message is queued.
+                _responseHandlers[_seq] = responseHandler;
+                _messagesForSendQueue.Enqueue(message);
+            }
         }
 
         private void SendingHandler()
@@ -461,13 +455,16 @@ namespace TVHeadEnd.HTSP
                     if (response.ContainsField("seq"))
                     {
                         int seqNo = response.GetInt("seq");
-                        if (_responseHandlers.TryGetValue(seqNo, out var currHTSResponseHandler))
+                        IHTSResponseHandler? responseHandler;
+                        bool handlerFound;
+                        lock (_responseLock)
                         {
-                            if (currHTSResponseHandler != null)
-                            {
-                                _responseHandlers.Remove(seqNo);
-                                currHTSResponseHandler.HandleResponse(response);
-                            }
+                            handlerFound = _responseHandlers.Remove(seqNo, out responseHandler);
+                        }
+
+                        if (handlerFound)
+                        {
+                            responseHandler?.HandleResponse(response);
                         }
                         else
                         {
